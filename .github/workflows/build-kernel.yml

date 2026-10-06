@@ -1,0 +1,102 @@
+name: Build Scarlet 4.19 with ReSukiSU
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+          fetch-depth: 1
+
+      - name: Install Toolchain & Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex \
+            libelf-dev libssl-dev lz4 make python3 libarchive-tools zip git \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+          # Install Neutron Clang Toolchain
+          mkdir -p "$GITHUB_WORKSPACE/clang"
+          cd "$GITHUB_WORKSPACE/clang"
+          curl -LO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+          bash antman -S
+          echo "$GITHUB_WORKSPACE/clang/bin" >> $GITHUB_PATH
+
+      - name: Integrate ReSukiSU Driver
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s main
+
+      - name: Detect Defconfig and Apply Method B
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+
+          # Auto-detect target config for jasmine/sdm660
+          TARGET_CONFIG=$(find arch/arm64/configs -name "*jasmine*" -o -name "*sdm660*" -o -name "*scarlet*" | head -n 1)
+          if [ -z "$TARGET_CONFIG" ]; then
+            echo "Error: No matching defconfig found!"
+            exit 1
+          fi
+          echo "Detected Defconfig: $TARGET_CONFIG"
+
+          # Append ReSukiSU flags to defconfig file
+          cat << 'EOF' >> "$TARGET_CONFIG"
+CONFIG_KSU=y
+CONFIG_KSU_MANUAL_HOOK=y
+CONFIG_KALLSYMS=y
+CONFIG_KALLSYMS_ALL=y
+EOF
+
+          # Extract relative path and build initial config
+          CONFIG_REL="${TARGET_CONFIG#arch/arm64/configs/}"
+          make O=out ARCH=arm64 "$CONFIG_REL"
+
+          # Enforce configs in out/.config and resolve dependencies
+          ./scripts/config --file out/.config \
+            -e KSU \
+            -e KSU_MANUAL_HOOK \
+            -e KALLSYMS \
+            -e KALLSYMS_ALL
+          make O=out ARCH=arm64 olddefconfig
+
+      - name: Compile Kernel
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+
+          make -j$(nproc --all) O=out ARCH=arm64 \
+            CC=clang \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            Image.gz-dtb || \
+          make -j$(nproc --all) O=out ARCH=arm64 \
+            CC=clang \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            Image.gz
+
+      - name: Package with AnyKernel3
+        run: |
+          git clone https://github.com/Atom-X-Devs/AnyKernel3 -b master AK3 || git clone https://github.com/osm0sis/AnyKernel3 AK3
+          
+          if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
+            cp out/arch/arm64/boot/Image.gz-dtb AK3/
+          elif [ -f out/arch/arm64/boot/Image.gz ]; then
+            cp out/arch/arm64/boot/Image.gz AK3/
+          fi
+
+          cd AK3
+          zip -r9 ../Scarlet-v11-ReSukiSU-jasmine.zip * -x .git README.md *placeholder
+
+      - name: Upload Kernel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Scarlet-v11-ReSukiSU-jasmine
+          path: Scarlet-v11-ReSukiSU-jasmine.zip
